@@ -10,6 +10,13 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const UPDATE_WINDOW_MS = 60_000;
 const UPDATE_MAX_REQUESTS = 10;
 const MAX_TRACKED_UPDATE_CLIENTS = 10_000;
+const PROXY_TIMEOUT_MS = Number.parseInt(process.env.PROXY_TIMEOUT_MS || "30000", 10);
+const CIRCUIT_FAILURE_THRESHOLD = 3;
+const CIRCUIT_COOLDOWN_MS = 30_000;
+
+if (!Number.isInteger(PROXY_TIMEOUT_MS) || PROXY_TIMEOUT_MS < 1_000) {
+  throw new Error("PROXY_TIMEOUT_MS must be an integer of at least 1000 milliseconds");
+}
 
 if (!UPDATE_TOKEN || Buffer.byteLength(UPDATE_TOKEN) < 32) {
   throw new Error("UPDATE_TOKEN must be set and contain at least 32 bytes");
@@ -21,6 +28,9 @@ if (!PUBLIC_HOST || !/^[a-z0-9.-]+$/i.test(PUBLIC_HOST)) {
 // This state is intentionally in memory; a restart requires the tunnel agent to update it.
 let currentOdooUrl = null;
 let shuttingDown = false;
+let consecutiveProxyFailures = 0;
+let circuitOpenUntil = 0;
+let probeInFlight = false;
 const updateAttempts = new Map();
 
 function clientAddress(req) {
@@ -96,12 +106,36 @@ function sanitizeUpstreamHeaders(proxyRes) {
     proxyRes.headers["set-cookie"] = cookies.map((cookie) => cookie.replace(/;\s*domain=\.?[a-z0-9-]+\.trycloudflare\.com/gi, `; Domain=${PUBLIC_HOST}`));
   }
 }
+function resetUpstreamHealth() {
+  consecutiveProxyFailures = 0;
+  circuitOpenUntil = 0;
+  probeInFlight = false;
+}
+
+function markUpstreamFailure() {
+  consecutiveProxyFailures += 1;
+  probeInFlight = false;
+
+  if (consecutiveProxyFailures >= CIRCUIT_FAILURE_THRESHOLD || circuitOpenUntil > 0) {
+    circuitOpenUntil = Date.now() + CIRCUIT_COOLDOWN_MS;
+    console.warn("[gateway] upstream circuit opened");
+  }
+}
+
+function canProxy() {
+  if (!currentOdooUrl) return false;
+  if (!circuitOpenUntil) return true;
+  if (Date.now() < circuitOpenUntil) return false;
+  if (probeInFlight) return false;
+  probeInFlight = true;
+  return true;
+}
 // Liveness only: the Node process can accept requests.
 app.get("/_gateway/health", (req, res) => res.json({ status: "ok" }));
 
 // Readiness: the gateway can send requests to Odoo.
 app.get("/_gateway/readiness", (req, res) => {
-  const ready = Boolean(currentOdooUrl) && !shuttingDown;
+  const ready = Boolean(currentOdooUrl) && !shuttingDown && !circuitOpenUntil;
   return res.status(ready ? 200 : 503).json({ ready });
 });
 
@@ -111,6 +145,7 @@ app.post("/_gateway/update", express.json({ limit: "4kb" }), authorizeGatewayCha
     return res.status(400).json({ error: "Invalid Quick Tunnel URL" });
   }
   currentOdooUrl = url.replace(/\/$/, "");
+  resetUpstreamHealth();
   console.log("[gateway] upstream updated");
   return res.json({ success: true });
 });
@@ -118,12 +153,13 @@ app.post("/_gateway/update", express.json({ limit: "4kb" }), authorizeGatewayCha
 // Clears all in-memory gateway state and immediately stops proxying traffic.
 app.post("/_gateway/clear", authorizeGatewayChange, (req, res) => {
   currentOdooUrl = null;
+  resetUpstreamHealth();
   console.log("[gateway] upstream cleared");
   return res.json({ success: true, ready: false });
 });
 
 app.get("/_gateway/status", (req, res) => {
-  return res.json({ ready: Boolean(currentOdooUrl) && !shuttingDown });
+  return res.json({ ready: Boolean(currentOdooUrl) && !shuttingDown && !circuitOpenUntil });
 });
 
 // Return controlled JSON for malformed/oversized update bodies.
@@ -139,13 +175,22 @@ const odooProxy = createProxyMiddleware({
   ws: true,
   xfwd: false,
   secure: true,
-  proxyTimeout: 120000,
-  timeout: 120000,
+  proxyTimeout: PROXY_TIMEOUT_MS,
+  timeout: PROXY_TIMEOUT_MS,
   on: {
     proxyReq: setForwardedHeaders,
     proxyReqWs: setForwardedHeaders,
-    proxyRes: sanitizeUpstreamHeaders,
+    proxyRes: (proxyRes) => {
+      sanitizeUpstreamHeaders(proxyRes);
+      // Cloudflare uses 520–530 when the Quick Tunnel cannot reach its origin.
+      if (proxyRes.statusCode >= 520 && proxyRes.statusCode <= 530) {
+        markUpstreamFailure();
+        return;
+      }
+      resetUpstreamHealth();
+    },
     error: (err, req, res) => {
+      markUpstreamFailure();
       console.error("[gateway] proxy error:", err.message);
       if (res && typeof res.writeHead === "function") {
         if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
@@ -158,7 +203,7 @@ const odooProxy = createProxyMiddleware({
 });
 
 app.use((req, res, next) => {
-  if (shuttingDown || !currentOdooUrl) return res.status(503).json({ error: "Odoo tunnel unavailable" });
+  if (shuttingDown || !canProxy()) return res.status(503).json({ error: "Odoo backend unavailable" });
   return next();
 });
 app.use(odooProxy);
@@ -177,7 +222,7 @@ server.on("connection", (socket) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
-  if (shuttingDown || !currentOdooUrl) {
+  if (shuttingDown || !canProxy()) {
     socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
     return;
   }
