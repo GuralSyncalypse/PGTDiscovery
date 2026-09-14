@@ -3,6 +3,7 @@ const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+app.disable("x-powered-by");
 const PORT = process.env.PORT || 3000;
 const UPDATE_TOKEN = process.env.UPDATE_TOKEN;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
@@ -73,6 +74,28 @@ function setForwardedHeaders(proxyReq, req) {
   proxyReq.setHeader("X-Forwarded-Port", "443");
 }
 
+function replaceTunnelHost(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(
+    /https?:\/\/[a-z0-9-]+\.trycloudflare\.com(?=[:/?#]|$)/gi,
+    `https://${PUBLIC_HOST}`
+  );
+}
+
+function sanitizeUpstreamHeaders(proxyRes) {
+  // Do not expose implementation details or the transient tunnel hostname.
+  delete proxyRes.headers.server;
+  delete proxyRes.headers["x-powered-by"];
+
+  for (const name of ["location", "link", "content-security-policy"]) {
+    if (proxyRes.headers[name]) proxyRes.headers[name] = replaceTunnelHost(proxyRes.headers[name]);
+  }
+
+  const cookies = proxyRes.headers["set-cookie"];
+  if (Array.isArray(cookies)) {
+    proxyRes.headers["set-cookie"] = cookies.map((cookie) => cookie.replace(/;\s*domain=\.?[a-z0-9-]+\.trycloudflare\.com/gi, `; Domain=${PUBLIC_HOST}`));
+  }
+}
 // Liveness only: the Node process can accept requests.
 app.get("/_gateway/health", (req, res) => res.json({ status: "ok" }));
 
@@ -121,6 +144,7 @@ const odooProxy = createProxyMiddleware({
   on: {
     proxyReq: setForwardedHeaders,
     proxyReqWs: setForwardedHeaders,
+    proxyRes: sanitizeUpstreamHeaders,
     error: (err, req, res) => {
       console.error("[gateway] proxy error:", err.message);
       if (res && typeof res.writeHead === "function") {
@@ -139,6 +163,12 @@ app.use((req, res, next) => {
 });
 app.use(odooProxy);
 
+// Never return error stacks or internal paths to a public client.
+app.use((err, req, res, next) => {
+  console.error("[gateway] unexpected error:", err.message);
+  if (res.headersSent) return next(err);
+  return res.status(500).json({ error: "Internal gateway error" });
+});
 const server = app.listen(PORT, "0.0.0.0", () => console.log(`Gateway listening on port ${PORT}`));
 const sockets = new Set();
 server.on("connection", (socket) => {
